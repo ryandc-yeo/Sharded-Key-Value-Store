@@ -1,13 +1,15 @@
 package viewservice
 
-import "net"
-import "net/rpc"
-import "log"
-import "time"
-import "sync"
-import "fmt"
-import "os"
-import "sync/atomic"
+import (
+	"fmt"
+	"log"
+	"net"
+	"net/rpc"
+	"os"
+	"sync"
+	"sync/atomic"
+	"time"
+)
 
 type ViewServer struct {
 	mu       sync.Mutex
@@ -16,54 +18,122 @@ type ViewServer struct {
 	rpccount int32 // for testing
 	me       string
 
-
 	// TODO: Your declarations here.
+	currentView View
+	lastPing    map[string]time.Time
+	ackdView    uint
+	hasStarted  bool
 }
 
-//
 // server Ping RPC handler.
-//
 func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 
 	// TODO: Your code here.
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
 
+	vs.lastPing[args.Me] = time.Now()
+
+	if args.Viewnum == 0 {
+		if args.Me == vs.currentView.Primary {
+			if vs.canChangeView() {
+				vs.promotePrimaryBackup()
+			}
+		}
+		if args.Me == vs.currentView.Backup {
+			if vs.canChangeView() {
+				vs.currentView.Backup = ""
+				vs.currentView.Viewnum++
+			}
+		}
+	}
+
+	// Handle first server startup
+	if !vs.hasStarted {
+		vs.currentView.Primary = args.Me
+		vs.currentView.Viewnum = 1
+		vs.hasStarted = true
+	}
+
+	if args.Me == vs.currentView.Primary && args.Viewnum == vs.currentView.Viewnum {
+		vs.ackdView = args.Viewnum
+	}
+
+	if vs.currentView.Backup == "" && args.Me != vs.currentView.Primary && vs.canChangeView() {
+		vs.currentView.Backup = args.Me
+		vs.currentView.Viewnum++
+	}
+
+	reply.View = vs.currentView
 	return nil
 }
 
-//
 // server Get() RPC handler.
-//
 func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 
 	// TODO: Your code here.
-
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	reply.View = vs.currentView
 	return nil
 }
 
-
-//
 // tick() is called once per PingInterval; it should notice
 // if servers have died or recovered, and change the view
 // accordingly.
-//
 func (vs *ViewServer) tick() {
 
 	// TODO: Your code here.
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+	if !vs.hasStarted {
+		return
+	}
+
+	now := time.Now()
+
+	// is primary dead
+	if vs.currentView.Primary != "" {
+		lastPing, ok := vs.lastPing[vs.currentView.Primary]
+		if !ok || now.Sub(lastPing) >= DeadPings*PingInterval {
+			if vs.canChangeView() {
+				vs.promotePrimaryBackup()
+			}
+		}
+	}
+
+	// is backup dead
+	if vs.currentView.Backup != "" {
+		lastPing, ok := vs.lastPing[vs.currentView.Backup]
+		if !ok || now.Sub(lastPing) >= DeadPings*PingInterval {
+			if vs.canChangeView() {
+				vs.currentView.Backup = ""
+				vs.currentView.Viewnum++
+			}
+		}
+	}
+
+	// if we need to find a new backup
+	if vs.currentView.Backup == "" && vs.canChangeView() {
+		for server, lastPing := range vs.lastPing {
+			if server != vs.currentView.Primary && now.Sub(lastPing) < DeadPings*PingInterval {
+				vs.currentView.Backup = server
+				vs.currentView.Viewnum++
+				break
+			}
+		}
+	}
 }
 
-//
 // tell the server to shut itself down.
 // for testing.
 // please don't change these two functions.
-//
 func (vs *ViewServer) Kill() {
 	atomic.StoreInt32(&vs.dead, 1)
 	vs.l.Close()
 }
 
-//
 // has this server been asked to shut down?
-//
 func (vs *ViewServer) isdead() bool {
 	return atomic.LoadInt32(&vs.dead) != 0
 }
@@ -77,6 +147,10 @@ func StartServer(me string) *ViewServer {
 	vs := new(ViewServer)
 	vs.me = me
 	// TODO: Your vs.* initializations here.
+	vs.currentView = View{Viewnum: 0, Primary: "", Backup: ""}
+	vs.lastPing = make(map[string]time.Time)
+	vs.ackdView = 0
+	vs.hasStarted = false
 
 	// tell net/rpc about our RPC server and handlers.
 	rpcs := rpc.NewServer()
@@ -120,4 +194,21 @@ func StartServer(me string) *ViewServer {
 	}()
 
 	return vs
+}
+
+// HELPER FUNCTIONS
+// check if we can change to a new view
+func (vs *ViewServer) canChangeView() bool {
+	return vs.ackdView == vs.currentView.Viewnum
+}
+
+// promote backup to primary
+func (vs *ViewServer) promotePrimaryBackup() {
+	if vs.currentView.Backup != "" {
+		vs.currentView.Primary = vs.currentView.Backup
+		vs.currentView.Backup = ""
+		vs.currentView.Viewnum++
+	} else {
+		vs.currentView.Primary = ""
+	}
 }
