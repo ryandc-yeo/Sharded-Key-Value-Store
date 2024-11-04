@@ -6,11 +6,15 @@ import (
 	"fmt"
 	"math/big"
 	"net/rpc"
+	"time"
 )
 
 type Clerk struct {
 	vs *viewservice.Clerk
 	// TODO: Your declarations here
+	primary string
+	me      string
+	id      int64
 }
 
 // this may come in handy.
@@ -25,6 +29,9 @@ func MakeClerk(vshost string, me string) *Clerk {
 	ck := new(Clerk)
 	ck.vs = viewservice.MakeClerk(me, vshost)
 	// TODO: Your ck.* initializations here
+	ck.me = me
+	ck.id = nrand()
+	ck.primary = ""
 
 	return ck
 }
@@ -69,14 +76,64 @@ func call(srv string, rpcname string,
 func (ck *Clerk) Get(key string) string {
 
 	// TODO: Your code here.
+	reqID := nrand()
+	args := &GetArgs{
+		Key:      key,
+		ReqID:    reqID,
+		ClientID: ck.id,
+	}
+	var reply GetReply
 
-	return "???"
+	for {
+		if ck.primary == "" {
+			ck.primary = ck.vs.Primary()
+			continue
+		}
+
+		ok := call(ck.primary, "PBServer.Get", args, &reply)
+		if !ok || reply.Err == ErrWrongServer {
+			ck.primary = ck.vs.Primary()
+			time.Sleep(viewservice.PingInterval)
+			continue
+		}
+
+		if reply.Err == OK {
+			return reply.Value
+		}
+	}
 }
 
 // send a Put or Append RPC
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	// TODO: Your code here.
+	reqID := nrand()
+	args := &PutAppendArgs{
+		Key:      key,
+		Value:    value,
+		Op:       op,
+		ReqID:    reqID,
+		ClientID: ck.id,
+	}
+	var reply PutAppendReply
+
+	for {
+		if ck.primary == "" {
+			ck.primary = ck.vs.Primary()
+			continue
+		}
+
+		ok := call(ck.primary, "PBServer.PutAppend", args, &reply)
+		if !ok || reply.Err == ErrWrongServer {
+			ck.primary = ck.vs.Primary()
+			time.Sleep(viewservice.PingInterval)
+			continue
+		}
+
+		if reply.Err == OK {
+			return
+		}
+	}
 }
 
 // tell the primary to update key's value.
