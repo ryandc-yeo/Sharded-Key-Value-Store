@@ -28,7 +28,7 @@ type PBServer struct {
 	db           map[string]string
 	seenRequests map[int64]string
 	seenClients  map[int64]int64
-	transferring bool
+	pendingOps   map[int64]bool
 }
 
 func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
@@ -37,21 +37,10 @@ func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
-	if pb.view.Primary != pb.me {
+	currentView, _ := pb.vs.Get()
+	if currentView.Primary != pb.me {
 		reply.Err = ErrWrongServer
 		return nil
-	}
-
-	// check for duplicate req
-	if val, ok := pb.seenRequests[args.ReqID]; ok {
-		reply.Value = val
-		reply.Err = OK
-		return nil
-	}
-
-	value, exists := pb.db[args.Key]
-	if !exists {
-		value = ""
 	}
 
 	if pb.view.Backup != "" {
@@ -63,22 +52,26 @@ func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 		var fwdReply ForwardGetReply
 
 		ok := call(pb.view.Backup, "PBServer.ForwardGet", fwdArgs, &fwdReply)
-		if !ok || fwdReply.Err != OK {
-			if pb.isunreliable() {
+		if !ok {
+			if !pb.isunreliable() {
+				reply.Err = ErrWrongServer
+				return nil
 			}
+		} else if fwdReply.Err == ErrWrongServer {
+			// Backup rejected our request, we might be stale
+			reply.Err = ErrWrongServer
+			return nil
 		}
 	}
 
-	// // forward the get req if we have backup
-	// if pb.view.Backup != "" {
-	// 	backupArgs := *args
-	// 	var backupReply GetReply
-	// 	ok := call(pb.view.Backup, "PBServer.Get", &backupArgs, &backupReply)
-	// 	if !ok {
-	// 		reply.Err = ErrWrongServer
-	// 		return nil
-	// 	}
-	// }
+	// check for duplicate req
+	if value, exists := pb.seenRequests[args.ReqID]; exists {
+		reply.Value = value
+		reply.Err = OK
+		return nil
+	}
+
+	value, _ := pb.db[args.Key]
 	pb.seenRequests[args.ReqID] = value
 	pb.seenClients[args.ClientID] = args.ReqID
 
@@ -93,12 +86,13 @@ func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error 
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
-	if pb.view.Primary != pb.me {
+	currentView, _ := pb.vs.Get()
+	if currentView.Primary != pb.me {
 		reply.Err = ErrWrongServer
 		return nil
 	}
 
-	if _, isDuplicate := pb.seenRequests[args.ReqID]; isDuplicate {
+	if _, exists := pb.seenRequests[args.ReqID]; exists {
 		reply.Err = OK
 		return nil
 	}
@@ -115,7 +109,7 @@ func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error 
 		var fwdReply ForwardPutAppendReply
 
 		ok := call(pb.view.Backup, "PBServer.ForwardPutAppend", fwdArgs, &fwdReply)
-		if !ok || fwdReply.Err != OK {
+		if !ok || fwdReply.Err == ErrWrongServer {
 			if !pb.isunreliable() {
 				reply.Err = ErrWrongServer
 				return nil
@@ -139,7 +133,8 @@ func (pb *PBServer) ForwardGet(args *ForwardGetArgs, reply *ForwardGetReply) err
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
-	if pb.view.Backup != pb.me {
+	currentView, _ := pb.vs.Get()
+	if currentView.Backup != pb.me {
 		reply.Err = ErrWrongServer
 		return nil
 	}
@@ -155,8 +150,13 @@ func (pb *PBServer) ForwardPutAppend(args *ForwardPutAppendArgs, reply *ForwardP
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
-	if pb.view.Backup != pb.me {
+	currentView, _ := pb.vs.Get()
+	if currentView.Backup != pb.me {
 		reply.Err = ErrWrongServer
+		return nil
+	}
+	if _, exists := pb.seenRequests[args.ReqID]; exists {
+		reply.Err = OK
 		return nil
 	}
 
@@ -200,50 +200,6 @@ func (pb *PBServer) TransferDB(args *TransferDBArgs, reply *TransferDBReply) err
 	return nil
 }
 
-// func (pb *PBServer) requestDBTransfer(primary string) {
-// 	args := &TransferDBArgs{}
-// 	var reply TransferDBReply
-
-// 	ok := call(primary, "PBServer.TransferDB", args, &reply)
-// 	if ok && reply.Err == OK {
-// 		pb.db = make(map[string]string)
-// 		for k, v := range reply.DB {
-// 			pb.db[k] = v
-// 		}
-// 		pb.seenRequests = make(map[int64]string)
-// 		for k, v := range reply.SeenRequests {
-// 			pb.seenRequests[k] = v
-// 		}
-// 		pb.seenClients = make(map[int64]int64)
-// 		for k, v := range reply.SeenClients {
-// 			pb.seenClients[k] = v
-// 		}
-// 	}
-// }
-
-// func (pb *PBServer) TransferState(args *TransferStateArgs, reply *TransferStateReply) error {
-// 	pb.mu.Lock()
-// 	defer pb.mu.Unlock()
-
-// 	if !pb.backup {
-// 		reply.Err = ErrWrongServer
-// 		return nil
-// 	}
-
-// 	pb.keyValue = make(map[string]string)
-// 	pb.completed = make(map[int64]int64)
-
-// 	for k, v := range args.KeyValue {
-// 		pb.keyValue[k] = v
-// 	}
-// 	for k, v := range args.Completed {
-// 		pb.completed[k] = v
-// 	}
-
-// 	reply.Err = OK
-// 	return nil
-// }
-
 // ping the viewserver periodically.
 // if view changed:
 //
@@ -255,37 +211,30 @@ func (pb *PBServer) tick() {
 
 	view, err := pb.vs.Ping(pb.view.Viewnum)
 	if err == nil {
-		if view.Viewnum != pb.view.Viewnum ||
-			(view.Backup == pb.me && pb.view.Backup != pb.me) {
-
-			if view.Backup == pb.me && pb.view.Backup != pb.me && view.Primary != "" {
+		if view.Viewnum != pb.view.Viewnum {
+			if view.Backup == pb.me && pb.view.Backup != pb.me {
 				args := &TransferDBArgs{}
 				var reply TransferDBReply
 
 				ok := call(view.Primary, "PBServer.TransferDB", args, &reply)
 				if ok && reply.Err == OK {
-					newDB := make(map[string]string)
-					newReqs := make(map[int64]string)
-					newClients := make(map[int64]int64)
+					pb.db = make(map[string]string)
+					pb.seenRequests = make(map[int64]string)
+					pb.seenClients = make(map[int64]int64)
 
 					for k, v := range reply.DB {
-						newDB[k] = v
+						pb.db[k] = v
 					}
 					for k, v := range reply.SeenRequests {
-						newReqs[k] = v
+						pb.seenRequests[k] = v
 					}
 					for k, v := range reply.SeenClients {
-						newClients[k] = v
+						pb.seenClients[k] = v
 					}
-
-					pb.db = newDB
-					pb.seenRequests = newReqs
-					pb.seenClients = newClients
 				}
 			}
-
-			pb.view = view
 		}
+		pb.view = view
 	}
 }
 
@@ -325,9 +274,7 @@ func StartServer(vshost string, me string) *PBServer {
 	pb.db = make(map[string]string)
 	pb.seenRequests = make(map[int64]string)
 	pb.seenClients = make(map[int64]int64)
-	// pb.dead = 0
-	// pb.unreliable = 0
-	// pb.transferring = false
+	pb.pendingOps = make(map[int64]bool)
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(pb)

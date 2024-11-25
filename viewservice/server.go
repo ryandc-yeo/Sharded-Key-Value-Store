@@ -34,35 +34,70 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 
 	vs.lastPing[args.Me] = time.Now()
 
-	if args.Viewnum == 0 {
-		if args.Me == vs.currentView.Primary {
-			if vs.canChangeView() {
-				vs.promotePrimaryBackup()
-			}
-		}
-		if args.Me == vs.currentView.Backup {
-			if vs.canChangeView() {
-				vs.currentView.Backup = ""
-				vs.currentView.Viewnum++
-			}
-		}
-	}
-
-	// Handle first server startup
+	// init first view when first server starts up
 	if !vs.hasStarted {
 		vs.currentView.Primary = args.Me
 		vs.currentView.Viewnum = 1
 		vs.hasStarted = true
+		vs.ackdView = 0
+		reply.View = vs.currentView
+		return nil
 	}
 
-	if args.Me == vs.currentView.Primary && args.Viewnum == vs.currentView.Viewnum {
-		vs.ackdView = args.Viewnum
+	// handle primary ack
+	if args.Me == vs.currentView.Primary {
+		if args.Viewnum == vs.currentView.Viewnum {
+			vs.ackdView = args.Viewnum
+		} else if args.Viewnum == 0 {
+			if vs.canChangeView() {
+				vs.promotePrimaryBackup()
+			}
+		}
 	}
 
+	// handle backup ack
+	if args.Me == vs.currentView.Backup && args.Viewnum == 0 {
+		if vs.canChangeView() {
+			vs.currentView.Backup = ""
+			vs.currentView.Viewnum++
+		}
+	}
+
+	// add new backup if needed
 	if vs.currentView.Backup == "" && args.Me != vs.currentView.Primary && vs.canChangeView() {
 		vs.currentView.Backup = args.Me
 		vs.currentView.Viewnum++
 	}
+
+	// if args.Viewnum == 0 {
+	// 	if args.Me == vs.currentView.Primary {
+	// 		if vs.canChangeView() {
+	// 			vs.promotePrimaryBackup()
+	// 		}
+	// 	}
+	// 	if args.Me == vs.currentView.Backup {
+	// 		if vs.canChangeView() {
+	// 			vs.currentView.Backup = ""
+	// 			vs.currentView.Viewnum++
+	// 		}
+	// 	}
+	// }
+
+	// // Handle first server startup
+	// if !vs.hasStarted {
+	// 	vs.currentView.Primary = args.Me
+	// 	vs.currentView.Viewnum = 1
+	// 	vs.hasStarted = true
+	// }
+
+	// if args.Me == vs.currentView.Primary && args.Viewnum == vs.currentView.Viewnum {
+	// 	vs.ackdView = args.Viewnum
+	// }
+
+	// if vs.currentView.Backup == "" && args.Me != vs.currentView.Primary && vs.canChangeView() {
+	// 	vs.currentView.Backup = args.Me
+	// 	vs.currentView.Viewnum++
+	// }
 
 	reply.View = vs.currentView
 	return nil
@@ -210,5 +245,6 @@ func (vs *ViewServer) promotePrimaryBackup() {
 		vs.currentView.Viewnum++
 	} else {
 		vs.currentView.Primary = ""
+		vs.currentView.Viewnum++
 	}
 }
