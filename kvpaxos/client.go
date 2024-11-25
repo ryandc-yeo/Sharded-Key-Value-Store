@@ -5,11 +5,14 @@ import (
 	"fmt"
 	"math/big"
 	"net/rpc"
+	"time"
 )
 
 type Clerk struct {
 	servers []string
 	// TODO: You will have to modify this struct.
+	clientId  int64
+	requestId int
 }
 
 func nrand() int64 {
@@ -23,6 +26,8 @@ func MakeClerk(servers []string) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// TODO: You'll have to add code here.
+	ck.clientId = nrand()
+	ck.requestId = 0
 	return ck
 }
 
@@ -63,12 +68,47 @@ func call(srv string, rpcname string,
 // keeps trying forever in the face of all other errors.
 func (ck *Clerk) Get(key string) string {
 	// TODO: You will have to modify this function.
-	return ""
+	ck.requestId++
+	args := &GetArgs{
+		Key:       key,
+		ClientId:  ck.clientId,
+		RequestId: ck.requestId,
+	}
+
+	for {
+		for _, srv := range ck.servers {
+			var reply GetReply
+			ok := call(srv, "KVPaxos.Get", args, &reply)
+			if ok && reply.Err == OK {
+				return reply.Value
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // shared by Put and Append.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// TODO: You will have to modify this function.
+	ck.requestId++
+	args := &PutAppendArgs{
+		Key:       key,
+		Value:     value,
+		Op:        op,
+		ClientId:  ck.clientId,
+		RequestId: ck.requestId,
+	}
+
+	for {
+		for _, srv := range ck.servers {
+			var reply PutAppendReply
+			ok := call(srv, "KVPaxos.PutAppend", args, &reply)
+			if ok && reply.Err == OK {
+				return
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 func (ck *Clerk) Put(key string, value string) {

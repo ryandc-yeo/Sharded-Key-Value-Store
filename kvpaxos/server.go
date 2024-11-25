@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 )
 
 const Debug = 0
@@ -27,6 +28,11 @@ type Op struct {
 	// TODO: Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Type      string // put/append/get
+	Key       string
+	Value     string
+	ClientId  int64
+	RequestId int
 }
 
 type KVPaxos struct {
@@ -38,17 +44,127 @@ type KVPaxos struct {
 	px         *paxos.Paxos
 
 	// TODO: Your definitions here.
+	kvstore     map[string]string
+	clientSeqs  map[int64]int
+	lastExecSeq int
 }
 
 func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
 	// TODO: Your code here.
+	if kv.isdead() {
+		return nil
+	}
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if lastSeq, exists := kv.clientSeqs[args.ClientId]; exists && args.RequestId <= lastSeq {
+		reply.Value = kv.kvstore[args.Key]
+		reply.Err = OK
+		return nil
+	}
+
+	seq := kv.px.Max() + 1
+	op := Op{
+		Type:      "Get",
+		Key:       args.Key,
+		ClientId:  args.ClientId,
+		RequestId: args.RequestId,
+	}
+
+	for !kv.isdead() {
+		kv.px.Start(seq, op)
+		decidedOp := kv.wait(seq)
+		kv.sync(seq)
+
+		if decidedOp.ClientId == op.ClientId && decidedOp.RequestId == op.RequestId {
+			reply.Value = kv.kvstore[args.Key]
+			reply.Err = OK
+			return nil
+		}
+		seq++
+	}
 	return nil
 }
 
 func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	// TODO: Your code here.
+	if kv.isdead() {
+		return nil
+	}
 
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	if lastSeq, exists := kv.clientSeqs[args.ClientId]; exists && args.RequestId <= lastSeq {
+		reply.Err = OK
+		return nil
+	}
+
+	seq := kv.px.Max() + 1
+	op := Op{
+		Type:      args.Op,
+		Key:       args.Key,
+		Value:     args.Value,
+		ClientId:  args.ClientId,
+		RequestId: args.RequestId,
+	}
+
+	for !kv.isdead() {
+		kv.px.Start(seq, op)
+		decidedOp := kv.wait(seq)
+		kv.sync(seq)
+
+		if decidedOp.ClientId == op.ClientId && decidedOp.RequestId == op.RequestId {
+			reply.Err = OK
+			return nil
+		}
+		seq++
+	}
 	return nil
+}
+
+// helpers
+
+func (kv *KVPaxos) wait(seq int) Op {
+	to := 10 * time.Millisecond
+	for {
+		if kv.isdead() {
+			return Op{}
+		}
+
+		status, decidedValue := kv.px.Status(seq)
+		if status == paxos.Decided {
+			return decidedValue.(Op)
+		}
+
+		time.Sleep(to)
+		if to < time.Second {
+			to *= 2
+		}
+	}
+}
+
+func (kv *KVPaxos) updateState(op Op) {
+	if lastSeq, exists := kv.clientSeqs[op.ClientId]; !exists || op.RequestId > lastSeq {
+		kv.clientSeqs[op.ClientId] = op.RequestId
+
+		switch op.Type {
+		case "Put":
+			kv.kvstore[op.Key] = op.Value
+		case "Append":
+			kv.kvstore[op.Key] = kv.kvstore[op.Key] + op.Value
+		}
+	}
+}
+
+func (kv *KVPaxos) sync(seq int) {
+	for i := kv.lastExecSeq + 1; i <= seq; i++ {
+		decidedOp := kv.wait(i)
+		kv.updateState(decidedOp)
+		kv.lastExecSeq = i
+		kv.px.Done(i)
+	}
 }
 
 // tell the server to shut itself down.
@@ -91,6 +207,9 @@ func StartServer(servers []string, me int) *KVPaxos {
 	kv.me = me
 
 	// TODO: Your initialization code here.
+	kv.kvstore = make(map[string]string)
+	kv.clientSeqs = make(map[int64]int)
+	kv.lastExecSeq = -1
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(kv)
