@@ -246,19 +246,28 @@ func (px *Paxos) Decided(args *DecidedArgs, reply *DecidedReply) error {
 }
 
 func (px *Paxos) propose(seq int, v interface{}) {
+	attempts := 0
 	for !px.isdead() {
 		if fate, _ := px.Status(seq); fate == Decided {
 			return
 		}
 
-		proposalNum := px.generateProposalNumber()
+		// exit if too many attempts
+		if attempts > 20 {
+			time.Sleep(100 * time.Millisecond)
+			attempts = 0
+			continue
+		}
+		attempts++
 
-		// prepare phase
+		proposalNum := px.generateProposalNumber()
 		prepareCount := 0
 		maxAcceptNum := -1
 		var maxAcceptVal interface{} = nil
+		majority := len(px.peers)/2 + 1
 
-		for i := 0; i < len(px.peers); i++ {
+		// prepare phase
+		for i := 0; prepareCount < majority && i < len(px.peers); i++ {
 			args := &PrepareArgs{
 				Seq:  seq,
 				N:    proposalNum,
@@ -279,21 +288,17 @@ func (px *Paxos) propose(seq int, v interface{}) {
 				}
 				px.updatePeerDone(i, reply.Done)
 			}
-
-			if prepareCount > len(px.peers)/2 {
-				break
-			}
 		}
 
 		// accept phase
-		if prepareCount > len(px.peers)/2 {
+		if prepareCount >= majority {
 			acceptVal := v
 			if maxAcceptVal != nil {
 				acceptVal = maxAcceptVal
 			}
 
 			acceptCount := 0
-			for i := 0; i < len(px.peers); i++ {
+			for i := 0; acceptCount < majority && i < len(px.peers); i++ {
 				args := &AcceptArgs{
 					Seq:  seq,
 					N:    proposalNum,
@@ -311,20 +316,14 @@ func (px *Paxos) propose(seq int, v interface{}) {
 					}
 					px.updatePeerDone(i, reply.Done)
 				}
-
-				if acceptCount > len(px.peers)/2 {
-					break
-				}
 			}
 
-			// decided phase
-			if acceptCount > len(px.peers)/2 {
+			if acceptCount >= majority {
 				px.broadcastDecision(seq, acceptVal)
 				return
 			}
 		}
 
-		// backoff before retry
 		time.Sleep(px.getBackoffDuration())
 	}
 }
@@ -353,9 +352,9 @@ func (px *Paxos) updatePeerDone(peer int, doneVal int) {
 }
 
 func (px *Paxos) getBackoffDuration() time.Duration {
-	baseDelay := 10 * time.Millisecond
-	maxDelay := 100 * time.Millisecond
-	jitter := time.Duration(rand.Int63n(10)) * time.Millisecond
+	baseDelay := 5 * time.Millisecond
+	maxDelay := 50 * time.Millisecond
+	jitter := time.Duration(rand.Int63n(int64(maxDelay)))
 	return min(baseDelay+jitter, maxDelay)
 }
 
@@ -376,18 +375,17 @@ func (px *Paxos) sendAccept(peer int, args *AcceptArgs, reply *AcceptReply) bool
 }
 
 func (px *Paxos) broadcastDecision(seq int, v interface{}) {
-	for i := 0; i < len(px.peers); i++ {
-		args := &DecidedArgs{
-			Seq:  seq,
-			V:    v,
-			Me:   px.me,
-			Done: px.getDoneValue(),
-		}
-		var reply DecidedReply
+	args := &DecidedArgs{
+		Seq:  seq,
+		V:    v,
+		Me:   px.me,
+		Done: px.getDoneValue(),
+	}
+	var reply DecidedReply
+	px.Decided(args, &reply)
 
-		if i == px.me {
-			px.Decided(args, &reply)
-		} else {
+	for i := 0; i < len(px.peers); i++ {
+		if i != px.me {
 			go func(peer int) {
 				call(px.peers[peer], "Paxos.Decided", args, &reply)
 			}(i)
@@ -511,9 +509,15 @@ func (px *Paxos) Min() int {
 		}
 	}
 
-	// clean up forgotten instances
-	for seq := range px.instances {
-		if seq <= min {
+	// cleanup forgotten instances
+	if len(px.instances) > 0 {
+		toDelete := make([]int, 0)
+		for seq := range px.instances {
+			if seq <= min {
+				toDelete = append(toDelete, seq)
+			}
+		}
+		for _, seq := range toDelete {
 			delete(px.instances, seq)
 		}
 	}
