@@ -322,3 +322,5 @@ unexpected EOF
 unexpected EOF
 unexpected EOF
 unexpected EOF
+signal: interrupt
+FAIL	cs134-24f-kv/kvpaxos	426.404s

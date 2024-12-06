@@ -10,9 +10,8 @@ import (
 
 type Clerk struct {
 	servers []string
-	// TODO: You will have to modify this struct.
-	clientId  int64
-	requestId int
+	// You will have to modify this struct.
+	prevId int64 //  Piggybacking client requests already served by the server to provide at-most-once semantics
 }
 
 func nrand() int64 {
@@ -25,9 +24,8 @@ func nrand() int64 {
 func MakeClerk(servers []string) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-	// TODO: You'll have to add code here.
-	ck.clientId = nrand()
-	ck.requestId = 0
+	// You'll have to add code here.
+	ck.prevId = -1
 	return ck
 }
 
@@ -67,48 +65,53 @@ func call(srv string, rpcname string,
 // returns "" if the key does not exist.
 // keeps trying forever in the face of all other errors.
 func (ck *Clerk) Get(key string) string {
-	// TODO: You will have to modify this function.
-	ck.requestId++
-	args := &GetArgs{
-		Key:       key,
-		ClientId:  ck.clientId,
-		RequestId: ck.requestId,
-	}
+	// You will have to modify this function.
 
-	for {
-		for _, srv := range ck.servers {
-			var reply GetReply
-			ok := call(srv, "KVPaxos.Get", args, &reply)
-			if ok && reply.Err == OK {
-				return reply.Value
+	//  Prepare the arguments
+	currId := nrand()
+	args := &GetArgs{Key: key, CurrId: currId, PrevId: ck.prevId} //  generate unique request ID to handle dup requests
+	var reply GetReply
+
+	//  Send an RPC request, wait for the reply
+	ok := false
+	for !ok {
+		//  Keep retrying until we get an answer
+		for _, server := range ck.servers {
+			ok = call(server, "KVPaxos.Get", args, &reply)
+			if !ok {
+				time.Sleep(RetryInterval)
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
 	}
+
+	//  Piggyback the ID of the request just served on the next request (to tell the server it has heard a reply for this RPC)
+	ck.prevId = currId
+	return reply.Value
 }
 
 // shared by Put and Append.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	// TODO: You will have to modify this function.
-	ck.requestId++
-	args := &PutAppendArgs{
-		Key:       key,
-		Value:     value,
-		Op:        op,
-		ClientId:  ck.clientId,
-		RequestId: ck.requestId,
-	}
+	// You will have to modify this function.
 
-	for {
-		for _, srv := range ck.servers {
-			var reply PutAppendReply
-			ok := call(srv, "KVPaxos.PutAppend", args, &reply)
-			if ok && reply.Err == OK {
-				return
+	//  Prepare the arguments
+	currId := nrand()
+	args := &PutAppendArgs{Key: key, Value: value, Op: op, CurrId: currId, PrevId: ck.prevId} //  generate unique request ID to handle dup requests
+	var reply PutAppendReply
+
+	//  Send an RPC request, wait for the reply
+	ok := false
+	for !ok {
+		//  Keep retrying until we get an answer
+		for _, server := range ck.servers {
+			ok = call(server, "KVPaxos.PutAppend", args, &reply)
+			if !ok {
+				time.Sleep(RetryInterval)
 			}
 		}
-		time.Sleep(100 * time.Millisecond)
 	}
+
+	//  Piggyback the ID of the request just served on the next request (to tell the server it has heard a reply for this RPC)
+	ck.prevId = currId
 }
 
 func (ck *Clerk) Put(key string, value string) {

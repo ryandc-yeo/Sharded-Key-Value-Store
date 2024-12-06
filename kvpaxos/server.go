@@ -25,14 +25,15 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 type Op struct {
-	// TODO: Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-	Type      string // put/append/get
+	// Your definitions here.
 	Key       string
 	Value     string
-	ClientId  int64
-	RequestId int
+	Operation string
+	CurrId    int64 //  Processing the current client request
+	PrevId    int64 //  Cleaning up client requests previously served
+
+	// Field names must start with capital letters,
+	// otherwise RPC will break.
 }
 
 type KVPaxos struct {
@@ -43,128 +44,188 @@ type KVPaxos struct {
 	unreliable int32 // for testing
 	px         *paxos.Paxos
 
-	// TODO: Your definitions here.
-	kvstore     map[string]string
-	clientSeqs  map[int64]int
-	lastExecSeq int
+	// Your definitions here.
+	currSeq      int               //  keeps track of current sequence instance
+	database     map[string]string //  keeps track of the k/v database
+	prevRequests map[int64]string  //  keeps track of requests sent by the client
 }
 
-func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
-	// TODO: Your code here.
-	if kv.isdead() {
-		return nil
-	}
+// Run Paxos on this instance until we have gained consensus
+func RunPaxos(kv *KVPaxos, seq int, v Op) Op {
+	kv.px.Start(seq, v)
 
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-	if lastSeq, exists := kv.clientSeqs[args.ClientId]; exists && args.RequestId <= lastSeq {
-		reply.Value = kv.kvstore[args.Key]
-		reply.Err = OK
-		return nil
-	}
-
-	seq := kv.px.Max() + 1
-	op := Op{
-		Type:      "Get",
-		Key:       args.Key,
-		ClientId:  args.ClientId,
-		RequestId: args.RequestId,
-	}
-
-	for !kv.isdead() {
-		kv.px.Start(seq, op)
-		decidedOp := kv.wait(seq)
-		kv.sync(seq)
-
-		if decidedOp.ClientId == op.ClientId && decidedOp.RequestId == op.RequestId {
-			reply.Value = kv.kvstore[args.Key]
-			reply.Err = OK
-			return nil
-		}
-		seq++
-	}
-	return nil
-}
-
-func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
-	// TODO: Your code here.
-	if kv.isdead() {
-		return nil
-	}
-
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
-	if lastSeq, exists := kv.clientSeqs[args.ClientId]; exists && args.RequestId <= lastSeq {
-		reply.Err = OK
-		return nil
-	}
-
-	seq := kv.px.Max() + 1
-	op := Op{
-		Type:      args.Op,
-		Key:       args.Key,
-		Value:     args.Value,
-		ClientId:  args.ClientId,
-		RequestId: args.RequestId,
-	}
-
-	for !kv.isdead() {
-		kv.px.Start(seq, op)
-		decidedOp := kv.wait(seq)
-		kv.sync(seq)
-
-		if decidedOp.ClientId == op.ClientId && decidedOp.RequestId == op.RequestId {
-			reply.Err = OK
-			return nil
-		}
-		seq++
-	}
-	return nil
-}
-
-// helpers
-
-func (kv *KVPaxos) wait(seq int) Op {
 	to := 10 * time.Millisecond
 	for {
-		if kv.isdead() {
-			return Op{}
-		}
-
-		status, decidedValue := kv.px.Status(seq)
-		if status == paxos.Decided {
-			return decidedValue.(Op)
+		operationStatus, operationValue := kv.px.Status(seq)
+		if operationStatus == paxos.Decided {
+			return operationValue.(Op)
 		}
 
 		time.Sleep(to)
-		if to < time.Second {
+		if to < 10*time.Second {
 			to *= 2
 		}
 	}
 }
 
-func (kv *KVPaxos) updateState(op Op) {
-	if lastSeq, exists := kv.clientSeqs[op.ClientId]; !exists || op.RequestId > lastSeq {
-		kv.clientSeqs[op.ClientId] = op.RequestId
-
-		switch op.Type {
-		case "Put":
-			kv.kvstore[op.Key] = op.Value
-		case "Append":
-			kv.kvstore[op.Key] = kv.kvstore[op.Key] + op.Value
+// Clean up client requests that have previously been served
+func FreePrevRequest(kv *KVPaxos, prevId int64) {
+	if prevId != -1 {
+		_, ok := kv.prevRequests[prevId]
+		if ok {
+			delete(kv.prevRequests, prevId)
 		}
 	}
 }
 
-func (kv *KVPaxos) sync(seq int) {
-	for i := kv.lastExecSeq + 1; i <= seq; i++ {
-		decidedOp := kv.wait(i)
-		kv.updateState(decidedOp)
-		kv.lastExecSeq = i
-		kv.px.Done(i)
+// The Paxos replicas have agreed on the order to apply this client request, so update the k/v database
+func ApplyOperation(kv *KVPaxos, operationResult Op) {
+	key, value, currId, operation := operationResult.Key, operationResult.Value, operationResult.CurrId, operationResult.Operation
+	prev, ok := kv.database[key]
+	//  Apply GET
+	if operation == "Get" {
+		if ok {
+			kv.prevRequests[currId] = prev
+		} else {
+			kv.prevRequests[currId] = ErrNoKey
+		}
+		//  Apply PUT
+	} else if operation == "Put" {
+		kv.database[key] = value
+		kv.prevRequests[currId] = OK
+		//  Apply APPEND
+	} else if operation == "Append" {
+		kv.database[key] = prev + value
+		kv.prevRequests[currId] = OK
 	}
+}
+
+// Checks to see if this is a duplicate GET request to ensure at-most-once semantics
+func IsDupGet(kv *KVPaxos, args *GetArgs) bool {
+	key, currId := args.Key, args.CurrId
+	prev, ok := kv.prevRequests[currId]
+
+	//  Duplicate RPC request
+	if ok && prev == key {
+		return true
+	}
+
+	return false
+}
+
+// GET request handler
+func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
+	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	//  Check if we have seen this request before, and if so, return stored value
+	if IsDupGet(kv, args) {
+		reply.Value = kv.database[args.Key]
+		reply.Err = OK
+		return nil
+	}
+
+	//  Try to assign the next available Paxos instance (sequence number) to each incoming client RPC
+	for {
+		//  Prepare Paxos value
+		operation := Op{Key: args.Key, Value: "", Operation: "Get", CurrId: args.CurrId, PrevId: args.PrevId}
+		currSeq := kv.currSeq
+		kv.currSeq++
+
+		//  Gain consensus on this Paxos instance
+		var operationResult Op
+		operationStatus, operationValue := kv.px.Status(currSeq)
+		//  We are decided on this instance
+		if operationStatus == paxos.Decided {
+			operationResult = operationValue.(Op)
+			//  We aren't decided on this instance, run Paxos until we are
+		} else {
+			operationResult = RunPaxos(kv, currSeq, operation)
+		}
+
+		//  Clean up client requests that have previously been served
+		FreePrevRequest(kv, args.PrevId)
+		//  We have agreed on this instance, so update database, and remember the request we served
+		ApplyOperation(kv, operationResult)
+		//  We are done processing this instance and will no longer need it or any previous instance
+		kv.px.Done(currSeq)
+
+		//  Paxos elected the current operation, so return GET result, done
+		if operationResult.CurrId == args.CurrId {
+			val := kv.prevRequests[args.CurrId]
+			if val == ErrNoKey {
+				reply.Value = ""
+				reply.Err = ErrNoKey
+			} else {
+				reply.Value = kv.prevRequests[args.CurrId]
+				reply.Err = OK
+			}
+
+			break
+		}
+	}
+
+	return nil
+}
+
+// Checks to see if this is a duplicate PUT/APPEND request to ensure at-most-once semantics
+func IsDupPutAppend(kv *KVPaxos, args *PutAppendArgs) bool {
+	_, ok := kv.prevRequests[args.CurrId]
+
+	//  Duplicate RPC request
+	if ok {
+		return true
+	}
+
+	return false
+}
+
+// PUT/APPEND request handler
+func (kv *KVPaxos) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
+	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+
+	//  Check if we have seen this request before
+	if IsDupPutAppend(kv, args) {
+		reply.Err = OK
+		return nil
+	}
+
+	//  Try to assign the next available Paxos instance (sequence number) to each incoming client RPC
+	for {
+		//  Prepare Paxos value
+		operation := Op{Key: args.Key, Value: args.Value, Operation: args.Op, CurrId: args.CurrId, PrevId: args.PrevId}
+		currSeq := kv.currSeq
+		kv.currSeq++
+
+		//  Gain consensus on this Paxos instance
+		var operationResult Op
+		operationStatus, operationValue := kv.px.Status(currSeq)
+		//  We are decided on this instance
+		if operationStatus == paxos.Decided {
+			operationResult = operationValue.(Op)
+			//  We aren't decided on this instance, run Paxos until we are
+		} else {
+			operationResult = RunPaxos(kv, currSeq, operation)
+		}
+
+		//  Clean up client requests that have previously been served
+		FreePrevRequest(kv, args.PrevId)
+		//  We have agreed on this instance, so update database, and remember the request we served
+		ApplyOperation(kv, operationResult)
+		//  We are done processing this instance and will no longer need it or any previous instance
+		kv.px.Done(currSeq)
+
+		//  Paxos elected the current operation, so done
+		if operationResult.CurrId == args.CurrId {
+			break
+		}
+	}
+
+	reply.Err = OK
+	return nil
 }
 
 // tell the server to shut itself down.
@@ -206,10 +267,10 @@ func StartServer(servers []string, me int) *KVPaxos {
 	kv := new(KVPaxos)
 	kv.me = me
 
-	// TODO: Your initialization code here.
-	kv.kvstore = make(map[string]string)
-	kv.clientSeqs = make(map[int64]int)
-	kv.lastExecSeq = -1
+	// Your initialization code here.
+	kv.currSeq = 0
+	kv.database = make(map[string]string)
+	kv.prevRequests = make(map[int64]string)
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(kv)
