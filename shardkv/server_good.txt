@@ -16,7 +16,7 @@ import (
 	"time"
 )
 
-const Debug = 0
+const Debug = 1
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -79,11 +79,13 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 	fmt.Printf("GID %d Server %d: Get request for key %s (shard %d, config %d)\n",
 		kv.gid, kv.me, args.Key, shard, kv.config.Num)
 
+	// First verify we should handle this shard
 	if kv.config.Shards[shard] != kv.gid {
 		reply.Err = ErrWrongGroup
 		return nil
 	}
 
+	// Then check for duplicate requests
 	if seq, ok := kv.clientSeq[args.ClientId]; ok && args.SeqNum <= seq {
 		if args.SeqNum == seq {
 			if kv.kvstore[shard] != nil {
@@ -98,6 +100,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 		return nil
 	}
 
+	// Create operation and run Paxos
 	op := Op{
 		Type:     "Get",
 		Key:      args.Key,
@@ -105,11 +108,13 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 		SeqNum:   args.SeqNum,
 	}
 
+	// Run consensus
 	seq := kv.lastApplied + 1
 	kv.px.Start(seq, op)
 	decided := kv.wait(seq)
 	kv.apply(seq)
 
+	// Check result after apply
 	if kv.config.Shards[shard] != kv.gid {
 		reply.Err = ErrWrongGroup
 		return nil
@@ -139,6 +144,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
+	// Check if we serve this key's shard
 	shard := key2shard(args.Key)
 	fmt.Printf("GID %d Server %d: %s request for key %s (shard %d, config %d)\n",
 		kv.gid, kv.me, args.Op, args.Key, shard, kv.config.Num)
@@ -147,6 +153,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 		return nil
 	}
 
+	// Create operation and start Paxos agreement
 	op := Op{
 		Type:     args.Op,
 		Key:      args.Key,
@@ -155,11 +162,13 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 		SeqNum:   args.SeqNum,
 	}
 
+	// Run Paxos consensus
 	seq := kv.lastApplied + 1
 	kv.px.Start(seq, op)
 	decided := kv.wait(seq)
 	kv.apply(seq)
 
+	// Check if our operation was decided
 	if decided.Type == op.Type && decided.ClientId == op.ClientId && decided.SeqNum == op.SeqNum {
 		reply.Err = OK
 		return nil
@@ -181,9 +190,11 @@ func (kv *ShardKV) apply(seq int) {
 				if kv.kvstore[op.Shard] == nil {
 					kv.kvstore[op.Shard] = make(map[string]string)
 				}
+				// Copy received data
 				for k, v := range op.Data {
 					kv.kvstore[op.Shard][k] = v
 				}
+				// Update client sequence numbers
 				for cid, seq := range op.ClientSeq {
 					if seq > kv.clientSeq[cid] {
 						kv.clientSeq[cid] = seq
@@ -195,19 +206,24 @@ func (kv *ShardKV) apply(seq int) {
 					fmt.Printf("GID %d Server %d: Applying config change from %d to %d. Old shards: %v, New shards: %v\n",
 						kv.gid, kv.me, kv.config.Num, op.Config.Num, kv.config.Shards, op.Config.Shards)
 
+					// Keep old data around temporarily
 					oldConfig := kv.config
 					newConfig := op.Config
 					oldStore := kv.kvstore
 					newStore := make(map[int]map[string]string)
+
+					// Copy data for shards we'll own in new config
 					for shard := 0; shard < shardmaster.NShards; shard++ {
 						if newConfig.Shards[shard] == kv.gid {
 							newStore[shard] = make(map[string]string)
+							// Copy existing data if we have it
 							if oldStore[shard] != nil {
 								for k, v := range oldStore[shard] {
 									newStore[shard][k] = v
 								}
 							}
 						} else if oldConfig.Shards[shard] == kv.gid {
+							// Keep old data around temporarily
 							newStore[shard] = oldStore[shard]
 						}
 					}
@@ -218,8 +234,10 @@ func (kv *ShardKV) apply(seq int) {
 						kv.gid, kv.me, newConfig.Num)
 				}
 
-			default:
+			default: // Put/Append/Get
 				shard := key2shard(op.Key)
+				// Allow operations on shards we own in current config
+				// OR shards we owned in previous config but haven't transferred yet
 				if kv.config.Shards[shard] == kv.gid {
 					fmt.Printf("GID %d Server %d: Applying op %s for key %s (shard %d, owned=true)\n",
 						kv.gid, kv.me, op.Type, op.Key, shard)
@@ -248,26 +266,24 @@ func (kv *ShardKV) Transfer(args *TransferArgs, reply *TransferReply) error {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
 
+	// Allow transfers if we're at args.ConfigNum OR args.ConfigNum + 1
 	if kv.config.Num != args.ConfigNum && kv.config.Num != args.ConfigNum+1 {
-		fmt.Printf("GID %d Server %d: Wrong config for transfer. Have %d, want %d\n",
-			kv.gid, kv.me, kv.config.Num, args.ConfigNum)
 		reply.Err = ErrWrongGroup
 		return nil
 	}
-
-	fmt.Printf("GID %d Server %d: Transferring shard %d with data\n",
-		kv.gid, kv.me, args.Shard)
 
 	reply.Err = OK
 	reply.KV = make(map[string]string)
 	reply.ClientSeq = make(map[int64]int64)
 
+	// Copy shard data
 	if data := kv.kvstore[args.Shard]; data != nil {
 		for k, v := range data {
 			reply.KV[k] = v
 		}
 	}
 
+	// Copy client sequence numbers
 	for cid, seq := range kv.clientSeq {
 		reply.ClientSeq[cid] = seq
 	}
@@ -283,20 +299,23 @@ func (kv *ShardKV) tick() {
 
 	newConfig := kv.sm.Query(-1)
 	if newConfig.Num > kv.config.Num {
+		// Process configurations one at a time
 		nextConfig := kv.sm.Query(kv.config.Num + 1)
 
+		// Track which shards we need to fetch
 		needShards := make(map[int]bool)
 		for shard := 0; shard < shardmaster.NShards; shard++ {
 			if nextConfig.Shards[shard] == kv.gid && kv.config.Shards[shard] != kv.gid {
 				needShards[shard] = true
 			}
 		}
+
+		// Try to get all needed shards
 		if len(needShards) > 0 {
 			for shard := range needShards {
 				oldGid := kv.config.Shards[shard]
 				if oldGid != 0 {
 					if servers, ok := kv.config.Groups[oldGid]; ok {
-						transferred := false
 						for _, srv := range servers {
 							args := &TransferArgs{
 								Shard:     shard,
@@ -311,18 +330,13 @@ func (kv *ShardKV) tick() {
 									Data:      reply.KV,
 									ClientSeq: reply.ClientSeq,
 								}
-
 								seq := kv.lastApplied + 1
 								kv.px.Start(seq, op)
 								kv.wait(seq)
 								kv.apply(seq)
-								transferred = true
 								delete(needShards, shard)
 								break
 							}
-						}
-						if !transferred {
-							return
 						}
 					}
 				} else {
@@ -331,6 +345,7 @@ func (kv *ShardKV) tick() {
 			}
 		}
 
+		// Only proceed if we have all needed shards
 		if len(needShards) == 0 {
 			op := Op{
 				Type:   "Reconfigure",
