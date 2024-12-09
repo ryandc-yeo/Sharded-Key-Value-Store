@@ -76,8 +76,6 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 	defer kv.mu.Unlock()
 
 	shard := key2shard(args.Key)
-	fmt.Printf("GID %d Server %d: Get request for key %s (shard %d, config %d)\n",
-		kv.gid, kv.me, args.Key, shard, kv.config.Num)
 
 	if kv.config.Shards[shard] != kv.gid {
 		reply.Err = ErrWrongGroup
@@ -93,6 +91,8 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 				} else {
 					reply.Err = ErrNoKey
 				}
+			} else {
+				reply.Err = ErrWrongGroup
 			}
 		}
 		return nil
@@ -115,18 +115,20 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 		return nil
 	}
 
+	if kv.kvstore[shard] == nil {
+		reply.Err = ErrWrongGroup
+		return nil
+	}
+
 	if decided.Type == op.Type && decided.ClientId == op.ClientId && decided.SeqNum == op.SeqNum {
-		if kv.kvstore[shard] != nil {
-			if value, exists := kv.kvstore[shard][args.Key]; exists {
-				reply.Value = value
-				reply.Err = OK
-				kv.clientSeq[args.ClientId] = args.SeqNum
-				return nil
-			}
+		if value, exists := kv.kvstore[shard][args.Key]; exists {
+			reply.Value = value
+			reply.Err = OK
+		} else {
 			reply.Err = ErrNoKey
-			kv.clientSeq[args.ClientId] = args.SeqNum
-			return nil
 		}
+		kv.clientSeq[args.ClientId] = args.SeqNum
+		return nil
 	}
 
 	reply.Err = ErrWrongGroup
@@ -140,7 +142,7 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 	defer kv.mu.Unlock()
 
 	shard := key2shard(args.Key)
-	fmt.Printf("GID %d Server %d: %s request for key %s (shard %d, config %d)\n",
+	DPrintf("GID %d Server %d: %s request for key %s (shard %d, config %d)\n",
 		kv.gid, kv.me, args.Op, args.Key, shard, kv.config.Num)
 	if kv.config.Shards[shard] != kv.gid {
 		reply.Err = ErrWrongGroup
@@ -174,10 +176,10 @@ func (kv *ShardKV) apply(seq int) {
 		decided, value := kv.px.Status(i)
 		if decided == paxos.Decided {
 			op := value.(Op)
+			shard := key2shard(op.Key)
+
 			switch op.Type {
 			case "Transfer":
-				fmt.Printf("GID %d Server %d: Applying transfer of shard %d with %d keys\n",
-					kv.gid, kv.me, op.Shard, len(op.Data))
 				if kv.kvstore[op.Shard] == nil {
 					kv.kvstore[op.Shard] = make(map[string]string)
 				}
@@ -185,44 +187,30 @@ func (kv *ShardKV) apply(seq int) {
 					kv.kvstore[op.Shard][k] = v
 				}
 				for cid, seq := range op.ClientSeq {
-					if seq > kv.clientSeq[cid] {
+					if oldSeq, exists := kv.clientSeq[cid]; !exists || seq > oldSeq {
 						kv.clientSeq[cid] = seq
 					}
 				}
 
 			case "Reconfigure":
 				if op.Config.Num == kv.config.Num+1 {
-					fmt.Printf("GID %d Server %d: Applying config change from %d to %d. Old shards: %v, New shards: %v\n",
-						kv.gid, kv.me, kv.config.Num, op.Config.Num, kv.config.Shards, op.Config.Shards)
-
 					oldConfig := kv.config
 					newConfig := op.Config
-					oldStore := kv.kvstore
-					newStore := make(map[int]map[string]string)
+
 					for shard := 0; shard < shardmaster.NShards; shard++ {
 						if newConfig.Shards[shard] == kv.gid {
-							newStore[shard] = make(map[string]string)
-							if oldStore[shard] != nil {
-								for k, v := range oldStore[shard] {
-									newStore[shard][k] = v
+							if oldConfig.Shards[shard] != kv.gid {
+								if kv.kvstore[shard] == nil {
+									kv.kvstore[shard] = make(map[string]string)
 								}
 							}
-						} else if oldConfig.Shards[shard] == kv.gid {
-							newStore[shard] = oldStore[shard]
 						}
 					}
-
-					kv.kvstore = newStore
 					kv.config = newConfig
-					fmt.Printf("GID %d Server %d: Completed config change to %d\n",
-						kv.gid, kv.me, newConfig.Num)
 				}
 
 			default:
-				shard := key2shard(op.Key)
 				if kv.config.Shards[shard] == kv.gid {
-					fmt.Printf("GID %d Server %d: Applying op %s for key %s (shard %d, owned=true)\n",
-						kv.gid, kv.me, op.Type, op.Key, shard)
 					if kv.kvstore[shard] == nil {
 						kv.kvstore[shard] = make(map[string]string)
 					}
@@ -249,13 +237,13 @@ func (kv *ShardKV) Transfer(args *TransferArgs, reply *TransferReply) error {
 	defer kv.mu.Unlock()
 
 	if kv.config.Num != args.ConfigNum && kv.config.Num != args.ConfigNum+1 {
-		fmt.Printf("GID %d Server %d: Wrong config for transfer. Have %d, want %d\n",
+		DPrintf("GID %d Server %d: Wrong config for transfer. Have %d, want %d\n",
 			kv.gid, kv.me, kv.config.Num, args.ConfigNum)
 		reply.Err = ErrWrongGroup
 		return nil
 	}
 
-	fmt.Printf("GID %d Server %d: Transferring shard %d with data\n",
+	DPrintf("GID %d Server %d: Transferring shard %d with data\n",
 		kv.gid, kv.me, args.Shard)
 
 	reply.Err = OK
@@ -282,65 +270,67 @@ func (kv *ShardKV) tick() {
 	defer kv.mu.Unlock()
 
 	newConfig := kv.sm.Query(-1)
-	if newConfig.Num > kv.config.Num {
-		nextConfig := kv.sm.Query(kv.config.Num + 1)
+	if newConfig.Num <= kv.config.Num {
+		return
+	}
 
-		needShards := make(map[int]bool)
-		for shard := 0; shard < shardmaster.NShards; shard++ {
-			if nextConfig.Shards[shard] == kv.gid && kv.config.Shards[shard] != kv.gid {
-				needShards[shard] = true
-			}
+	nextConfig := kv.sm.Query(kv.config.Num + 1)
+
+	needShards := make(map[int]bool)
+	for shard := 0; shard < shardmaster.NShards; shard++ {
+		if nextConfig.Shards[shard] == kv.gid && kv.config.Shards[shard] != kv.gid {
+			needShards[shard] = true
 		}
-		if len(needShards) > 0 {
-			for shard := range needShards {
-				oldGid := kv.config.Shards[shard]
-				if oldGid != 0 {
-					if servers, ok := kv.config.Groups[oldGid]; ok {
-						transferred := false
-						for _, srv := range servers {
-							args := &TransferArgs{
-								Shard:     shard,
-								ConfigNum: kv.config.Num,
-							}
-							var reply TransferReply
-							ok := call(srv, "ShardKV.Transfer", args, &reply)
-							if ok && reply.Err == OK {
-								op := Op{
-									Type:      "Transfer",
-									Shard:     shard,
-									Data:      reply.KV,
-									ClientSeq: reply.ClientSeq,
-								}
+	}
 
-								seq := kv.lastApplied + 1
-								kv.px.Start(seq, op)
-								kv.wait(seq)
-								kv.apply(seq)
-								transferred = true
-								delete(needShards, shard)
-								break
-							}
+	if len(needShards) > 0 {
+		for shard := range needShards {
+			oldGid := kv.config.Shards[shard]
+			if oldGid != 0 {
+				if servers, ok := kv.config.Groups[oldGid]; ok {
+					transferred := false
+					for _, srv := range servers {
+						args := &TransferArgs{
+							Shard:     shard,
+							ConfigNum: kv.config.Num,
 						}
-						if !transferred {
-							return
+						var reply TransferReply
+						ok := call(srv, "ShardKV.Transfer", args, &reply)
+						if ok && reply.Err == OK {
+							op := Op{
+								Type:      "Transfer",
+								Shard:     shard,
+								Data:      reply.KV,
+								ClientSeq: reply.ClientSeq,
+							}
+							seq := kv.lastApplied + 1
+							kv.px.Start(seq, op)
+							kv.wait(seq)
+							kv.apply(seq)
+							transferred = true
+							delete(needShards, shard)
+							break
 						}
 					}
-				} else {
-					delete(needShards, shard)
+					if !transferred {
+						return
+					}
 				}
+			} else {
+				delete(needShards, shard)
 			}
 		}
+	}
 
-		if len(needShards) == 0 {
-			op := Op{
-				Type:   "Reconfigure",
-				Config: nextConfig,
-			}
-			seq := kv.lastApplied + 1
-			kv.px.Start(seq, op)
-			kv.wait(seq)
-			kv.apply(seq)
+	if len(needShards) == 0 {
+		op := Op{
+			Type:   "Reconfigure",
+			Config: nextConfig,
 		}
+		seq := kv.lastApplied + 1
+		kv.px.Start(seq, op)
+		kv.wait(seq)
+		kv.apply(seq)
 	}
 }
 
