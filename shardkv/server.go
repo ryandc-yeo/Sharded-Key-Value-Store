@@ -25,6 +25,14 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+type ShardState int
+
+const (
+	Serving ShardState = iota
+	Pulling
+	Missing
+)
+
 type Op struct {
 	// Your definitions here.
 	Type      string
@@ -50,10 +58,12 @@ type ShardKV struct {
 	gid int64 // my replica group ID
 
 	// TODO: Your definitions here.
-	config      shardmaster.Config
-	kvstore     map[int]map[string]string
-	clientSeq   map[int64]int64
-	lastApplied int
+	config       shardmaster.Config
+	kvstore      map[int]map[string]string
+	clientSeq    map[int64]int64
+	lastApplied  int
+	shardStates  map[int]ShardState
+	pullingShard sync.WaitGroup
 }
 
 func (kv *ShardKV) wait(seq int) Op {
@@ -73,11 +83,10 @@ func (kv *ShardKV) wait(seq int) Op {
 func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 	// TODO: Your code here.
 	kv.mu.Lock()
-	defer kv.mu.Unlock()
-
 	shard := key2shard(args.Key)
 
-	if kv.config.Shards[shard] != kv.gid || kv.kvstore[shard] == nil {
+	if kv.config.Shards[shard] != kv.gid || kv.shardStates[shard] != Serving {
+		kv.mu.Unlock()
 		reply.Err = ErrWrongGroup
 		return nil
 	}
@@ -91,6 +100,7 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 				reply.Err = ErrNoKey
 			}
 		}
+		kv.mu.Unlock()
 		return nil
 	}
 
@@ -103,13 +113,19 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) error {
 
 	seq := kv.lastApplied + 1
 	kv.px.Start(seq, op)
+	kv.mu.Unlock()
+
 	decided := kv.wait(seq)
+
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
 	kv.apply(seq)
 
-	if kv.config.Shards[shard] != kv.gid || kv.kvstore[shard] == nil {
+	if kv.config.Shards[shard] != kv.gid || kv.shardStates[shard] != Serving {
 		reply.Err = ErrWrongGroup
 		return nil
 	}
+
 	if decided.Type == op.Type && decided.ClientId == op.ClientId && decided.SeqNum == op.SeqNum {
 		if value, exists := kv.kvstore[shard][args.Key]; exists {
 			reply.Value = value
@@ -176,32 +192,24 @@ func (kv *ShardKV) apply(seq int) {
 				for k, v := range op.Data {
 					kv.kvstore[op.Shard][k] = v
 				}
-
 				for cid, seq := range op.ClientSeq {
 					if oldSeq, exists := kv.clientSeq[cid]; !exists || seq > oldSeq {
 						kv.clientSeq[cid] = seq
 					}
 				}
+				kv.shardStates[op.Shard] = Serving
 
 			case "Reconfigure":
 				if op.Config.Num == kv.config.Num+1 {
-					oldConfig := kv.config
-					newConfig := op.Config
-					for shard := 0; shard < shardmaster.NShards; shard++ {
-						if newConfig.Shards[shard] == kv.gid {
-							if oldConfig.Shards[shard] != kv.gid {
-								if kv.kvstore[shard] == nil {
-									kv.kvstore[shard] = make(map[string]string)
-								}
-							}
-						}
-					}
-					kv.config = newConfig
+					kv.config = op.Config
 				}
 
 			default:
-				if kv.config.Shards[shard] == kv.gid && kv.kvstore[shard] != nil {
+				if kv.config.Shards[shard] == kv.gid && kv.shardStates[shard] == Serving {
 					if op.SeqNum > kv.clientSeq[op.ClientId] {
+						if kv.kvstore[shard] == nil {
+							kv.kvstore[shard] = make(map[string]string)
+						}
 						switch op.Type {
 						case "Put":
 							kv.kvstore[shard][op.Key] = op.Value
@@ -262,18 +270,18 @@ func (kv *ShardKV) tick() {
 	}
 
 	nextConfig := kv.sm.Query(kv.config.Num + 1)
-	needShards := make(map[int]bool)
 	for shard := 0; shard < shardmaster.NShards; shard++ {
 		if nextConfig.Shards[shard] == kv.gid && kv.config.Shards[shard] != kv.gid {
-			needShards[shard] = true
+			kv.shardStates[shard] = Pulling
 		}
 	}
-
-	if len(needShards) > 0 {
-		for shard := range needShards {
+	allReady := true
+	for shard := 0; shard < shardmaster.NShards; shard++ {
+		if kv.shardStates[shard] == Pulling {
 			oldGid := kv.config.Shards[shard]
 			if oldGid != 0 {
 				if servers, ok := kv.config.Groups[oldGid]; ok {
+					transferred := false
 					for _, srv := range servers {
 						args := &TransferArgs{
 							Shard:     shard,
@@ -292,18 +300,25 @@ func (kv *ShardKV) tick() {
 							kv.px.Start(seq, op)
 							kv.wait(seq)
 							kv.apply(seq)
-							delete(needShards, shard)
+							kv.shardStates[shard] = Serving
+							transferred = true
 							break
 						}
 					}
+					if !transferred {
+						allReady = false
+					}
 				}
 			} else {
-				delete(needShards, shard)
+				kv.shardStates[shard] = Serving
+				if kv.kvstore[shard] == nil {
+					kv.kvstore[shard] = make(map[string]string)
+				}
 			}
 		}
 	}
 
-	if len(needShards) == 0 {
+	if allReady {
 		op := Op{
 			Type:   "Reconfigure",
 			Config: nextConfig,
@@ -312,6 +327,16 @@ func (kv *ShardKV) tick() {
 		kv.px.Start(seq, op)
 		kv.wait(seq)
 		kv.apply(seq)
+
+		for shard := 0; shard < shardmaster.NShards; shard++ {
+			if nextConfig.Shards[shard] == kv.gid {
+				if kv.shardStates[shard] != Serving {
+					kv.shardStates[shard] = Serving
+				}
+			} else {
+				kv.shardStates[shard] = Missing
+			}
+		}
 	}
 }
 
@@ -366,6 +391,10 @@ func StartServer(gid int64, shardmasters []string,
 	kv.config = shardmaster.Config{Num: 0, Shards: [10]int64{}, Groups: map[int64][]string{}}
 	kv.kvstore = make(map[int]map[string]string)
 	kv.clientSeq = make(map[int64]int64)
+	kv.shardStates = make(map[int]ShardState)
+	for i := 0; i < shardmaster.NShards; i++ {
+		kv.shardStates[i] = Missing
+	}
 
 	rpcs := rpc.NewServer()
 	rpcs.Register(kv)
