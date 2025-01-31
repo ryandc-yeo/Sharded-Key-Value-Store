@@ -1,4 +1,4 @@
-# Key Value Store Project
+# Sharded Key Value Store Project
 
 Primary-backup replication for a simple key-value store.
 
