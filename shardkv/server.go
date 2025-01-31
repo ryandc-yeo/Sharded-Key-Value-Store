@@ -198,10 +198,34 @@ func (kv *ShardKV) apply(seq int) {
 					}
 				}
 				kv.shardStates[op.Shard] = Serving
+				DPrintf("GID %d Server %d: Transfer complete for shard %d\n",
+					kv.gid, kv.me, op.Shard)
 
 			case "Reconfigure":
 				if op.Config.Num == kv.config.Num+1 {
+					oldConfig := kv.config
 					kv.config = op.Config
+
+					// Update shard states during reconfiguration
+					for shard := 0; shard < shardmaster.NShards; shard++ {
+						if op.Config.Shards[shard] == kv.gid {
+							if oldConfig.Shards[shard] != kv.gid {
+								if oldConfig.Shards[shard] == 0 {
+									// Can immediately serve shards from group 0
+									kv.shardStates[shard] = Serving
+									if kv.kvstore[shard] == nil {
+										kv.kvstore[shard] = make(map[string]string)
+									}
+								}
+							}
+						} else {
+							if oldConfig.Shards[shard] == kv.gid {
+								kv.shardStates[shard] = Missing
+							}
+						}
+					}
+					DPrintf("GID %d Server %d: Reconfigured from %d to %d\n",
+						kv.gid, kv.me, oldConfig.Num, op.Config.Num)
 				}
 
 			default:
@@ -213,9 +237,13 @@ func (kv *ShardKV) apply(seq int) {
 						switch op.Type {
 						case "Put":
 							kv.kvstore[shard][op.Key] = op.Value
+							DPrintf("GID %d Server %d: Applied Put %s = %s\n",
+								kv.gid, kv.me, op.Key, op.Value)
 						case "Append":
 							oldVal := kv.kvstore[shard][op.Key]
 							kv.kvstore[shard][op.Key] = oldVal + op.Value
+							DPrintf("GID %d Server %d: Applied Append %s += %s\n",
+								kv.gid, kv.me, op.Key, op.Value)
 						}
 						kv.clientSeq[op.ClientId] = op.SeqNum
 					}
